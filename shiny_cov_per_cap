@@ -1,0 +1,254 @@
+rm(list=ls())
+
+library(remotes)
+library(rsconnect)
+library(nCov2019)
+library(tidyverse)
+library(shiny)
+library(shinyWidgets)
+library(RColorBrewer)
+library(sf)
+library(ggiraph)
+library(lubridate)
+library(directlabels)
+library(wbstats)
+library(rnaturalearthdata)
+library(rgeos)
+# remotes::install_github("GuangchuangYu/nCov2019")
+
+rsconnect::setAccountInfo(name = 'jonnez',
+                          token = '588AC62D798AB46B6C977255A4090091',
+                          secret = 'eqFvDnw3nfRcMv1yRKYAOp42Mb0b8HjcxXt+gZDx')
+
+## Load Data ------------------------------------
+x <- load_nCov2019(lang = 'en', source = 'github')
+dat <- x['global']
+
+# load population data
+pop_data <- filter(wb(indicator = "SP.POP.TOTL"), date == max(date)) %>%
+  select(value, country)
+# join data and calculate confirmed cases per capita
+dat <- dat %>%
+  left_join(pop_data, by = "country") %>%
+  rename(capita = "value") %>%
+  mutate(conf_per_cap = cum_confirm / capita) %>%
+  arrange(conf_per_cap)
+
+# selecting countries to choose from
+countries <- dat %>%
+  filter(time == (Sys.Date() - 1) & !grepl('Diam', country)) %>%
+  top_n(40, cum_confirm)
+selectCountries <- countries %>%
+  filter(time == (Sys.Date() - 1) & !grepl('Diam', country)) %>%
+  top_n(20, cum_confirm)
+
+# filter current data
+datnow <- dat %>%
+  filter(time == last(time)) %>%
+  filter(!is.na(country)) %>%
+  rbind(list(last(dat$time), "North Korea", NA, NA, NA, NA, NA))
+
+# worldmapping data prep
+world <- sf::st_as_sf(rnaturalearth::countries110) %>%
+  rename(country = name_long) %>% 
+  mutate(country = replace(country, country == 'Russian Federation', 'Russia'),
+         country = replace(country, country == 'Republic of Korea', 'South Korea'),
+         country = replace(country, country == 'Dem. Rep. Korea', 'North Korea')) %>%
+  filter(country %in% datnow$country)
+world <- world %>%
+  full_join(datnow %>%
+               select('country', 'cum_confirm',
+                      'conf_per_cap'), by = 'country')
+world <- st_as_sf(world)
+
+ref <- "Tianzhi Wu, Erqiang Hu, Xijin Ge*, Guangchuang Yu*.
+    Open-source analytics tools for studying the COVID-19 coronavirus outbreak.
+    medRxiv, 2020.02.25.20027433. doi: https://doi.org/10.1101/2020.02.25.20027433"
+
+# Defining the User Interface
+ui <- fluidPage(
+  setSliderColor("LightSeaGreen", 1),
+  chooseSliderSkin("Modern"),
+  navbarPage("nCovid-19 cases",
+             tabPanel("Affected",
+                      sidebarLayout(
+                        sidebarPanel(
+                          tabsetPanel(
+                            tabPanel("Dates",
+                                     sliderInput(inputId = "dateRangeA",
+                                                 label = paste("Choose a time period:"),
+                                                 min = as.Date("2020-02-01"),
+                                                 max = as.Date(Sys.Date() - 1),
+                                                 value = c(as.Date("2020-02-01"), as.Date(Sys.Date() - 1)))
+                            ),
+                            tabPanel("Countries",
+                                     checkboxGroupInput(inputId = "countryA",
+                                                        label = "Countries to show:",
+                                                        choices = countries$country,
+                                                        selected = selectCountries$country),
+                            )
+                          ), style='width: 250px'
+                        ),
+                        div(
+                          style = 'margin-left: 300px; position: fixed',
+                          plotOutput("dateA",
+                                     width = 950),
+                          p(em(ref), style = "font-family: 'times'; font-size:10px")
+                        )
+                      )
+             ),
+             tabPanel("Affected per Capita",
+                      sidebarLayout(
+                        sidebarPanel(
+                          tabsetPanel(
+                            tabPanel("Dates",
+                                     sliderInput(inputId = "dateRangeAC",
+                                                 label = paste("Choose a time period:"),
+                                                 min = as.Date("2020-02-01"),
+                                                 max = as.Date(Sys.Date() - 1),
+                                                 value = c(as.Date("2020-02-01"), as.Date(Sys.Date() - 1)))
+                            ),
+                            tabPanel("Countries",
+                                     checkboxGroupInput(inputId = "countryAC",
+                                                        label = "Countries to show:",
+                                                        choices = countries$country,
+                                                        selected = selectCountries$country),
+                            )
+                          ), style='width: 250px'
+                        ),
+                        div(
+                          style = 'margin-left: 300px; position: fixed',
+                          plotOutput("dateAC",
+                                     width = 950),
+                          p(em(ref), style = "font-family: 'times'; font-size:10px")
+                        )
+                      )
+             ),
+             tabPanel("Map of Affected",
+                      mainPanel(
+                        plotOutput("mapA",
+                                   width = 1200,
+                                   height = 600,
+                                   dblclick = "plot1_dblclick",
+                                   brush = brushOpts(
+                                     id = "plot1_brush",
+                                     resetOnNew = TRUE)),
+                        p(em(ref), style = "font-family: 'times'; font-size:10px")
+                      )
+             ),
+             tabPanel("Map of Affected per Capita",
+                      mainPanel(
+                        plotOutput("mapAC",
+                                   width = 1200,
+                                   height = 600,
+                                   dblclick = "plot2_dblclick",
+                                   brush = brushOpts(
+                                     id = "plot2_brush",
+                                     resetOnNew = TRUE)),
+                        p(em(ref), style = "font-family: 'times'; font-size:10px")
+                      )
+             )
+  )
+) # END UI
+
+# Define Server logic for creating graphs
+server <- function(input, output) {
+  
+  ranges <- reactiveValues(x = NULL, y = NULL)
+  
+  output$dateA <- renderPlot({
+    dat %>%
+      filter(country %in% input$countryA) %>%
+      ggplot(aes(x = time,
+                 y = cum_confirm,
+                 group = country,
+                 colour = country)) +
+      geom_line(size = 1.1) +
+      scale_colour_discrete(guide = 'none') +
+      geom_dl(aes(label = country), method = list(dl.trans(x = x + 0.1, y = y + 0.2),
+                                                  "last.points", cex = 1)) +
+      coord_cartesian(clip = 'off') +
+      theme(plot.margin = margin(0, 3, 0, 0, unit = "cm")) +
+      xlim(c(input$dateRangeA[1], input$dateRangeA[2])) +
+      ggtitle("Confirmed cases over time") +
+      labs(x = "Time", y = "Confirmed cases", colour = "Country")
+  }) # END OUTPUT DATE A
+  
+  output$dateAC <- renderPlot({
+    dat %>%
+      filter(country %in% input$countryAC) %>%
+      ggplot(aes(x = time, y = conf_per_cap,
+                 colour = country)) +
+      geom_line(size = 1.1) +
+      scale_colour_discrete(guide = 'none') +
+      geom_dl(aes(label = country), method = list(dl.trans(x = x + 0.1, y = y + 0.2),
+                                                  "last.points", cex = 1)) +
+      coord_cartesian(clip = 'off') +
+      theme(plot.margin = margin(0, 3, 0, 0, unit = "cm")) +
+      xlim(c(input$dateRangeAC[1], input$dateRangeAC[2])) +
+      ggtitle("Confirmed cases per capita over time") +
+      labs(x = "Time", y = "Confirmed cases per capita", colour = "Country")
+  }) # END OUTPUT DATE AC
+  
+  output$mapA <- renderPlot({
+    world %>%  
+      ggplot() +
+      geom_sf(
+        aes(geometry = geometry,
+            group = country,
+            fill = log(cum_confirm)),
+        colour ='black') +
+      labs(title = 'Confirmed cases of Covid-19') +
+      coord_sf(xlim = ranges$x, ylim = ranges$y, expand = FALSE) +
+      scale_fill_gradient(name = "Cases",
+                          low = "#fcf7f7", high = "#780000",
+                          breaks = c(min(world$cum_confirm, na.rm = T),
+                                     max(world$cum_confirm, na.rm = T)),
+                          labels = c(as.character(min(world$cum_confirm, na.rm = T)),
+                                     as.character(max(world$cum_confirm, na.rm = T))),
+                          limits = c(min(log(world$cum_confirm), na.rm = T),
+                                     max(log(world$cum_confirm), na.rm = T)))
+  }) # END OUTPUT MAP A
+  
+  observeEvent(input$plot1_dblclick, {
+    brush <- input$plot1_brush
+    if (!is.null(brush)) {
+      ranges$x <- c(brush$xmin, brush$xmax)
+      ranges$y <- c(brush$ymin, brush$ymax)
+    } else {
+      ranges$x <- NULL
+      ranges$y <- NULL
+    }
+  }) # END OBSERVE EVENT 1
+
+  output$mapAC <- renderPlot({
+    world %>%  
+      ggplot() +
+      geom_sf(
+        aes(geometry = geometry,
+            group = country,
+            fill = abs(log(conf_per_cap)),
+            colour ='black') +
+      labs(title = "Confirmed cases of Covid-19 per capita") +
+      coord_sf(xlim = ranges$x, ylim = ranges$y, expand = FALSE) +
+      theme(plot.margin = margin(0, 3, 0, 0, unit = "cm")) +
+      scale_fill_gradient(name = "(absolute log of) Cases per capita",
+                          low = "#fcf7f7", high = "#780000")
+    
+  }) # END OUTPUT MAP AC
+  
+  observeEvent(input$plot2_dblclick, {
+    brush <- input$plot2_brush
+    if (!is.null(brush)) {
+      ranges$x <- c(brush$xmin, brush$xmax)
+      ranges$y <- c(brush$ymin, brush$ymax)
+    } else {
+      ranges$x <- NULL
+      ranges$y <- NULL
+    }
+  }) # END OBSERVE EVENT 2
+  
+} # END SERVER
+
+# Run the app
+shinyApp(ui = ui, server = server)
